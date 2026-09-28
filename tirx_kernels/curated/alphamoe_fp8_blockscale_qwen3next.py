@@ -38,7 +38,8 @@ The final route's threads reduce all ten expert results in route order.
 For M <= 32, two BF16 results and a generation tag share an aligned 64-bit
 word. Scalar GPU-scope relaxed loads/stores atomically observe the payload and
 tag together. M=1 toggles a per-record phase on each ordered launch; the other
-small shapes use the launch epoch. M >= 64 stores compact BF16 scratch and
+small shapes use per-CTA device generation counters, including graph replays.
+M >= 64 stores compact BF16 scratch and
 publishes completion through a release counter, acquired before reduction.
 Scratch belongs to one launcher; calls sharing it must execute in order.
 
@@ -266,6 +267,9 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
         s_amax = smem.alloc((NT, 4), txl.f32, align=16)
         s_scl = smem.alloc((NT, 2), txl.f32, align=16)
         s_misc = smem.alloc((8,), txl.i32, align=16)
+        if TAGGED:
+            with txl.If(tid == 0), txl.Then():
+                txl.ptx.red.relaxed.gpu.global_.add.u32(sync_ctr.ptr_to([cta]), txl.uint32(1))
         s_stg = smem.alloc((2, NT, BM), txl.u16, align=128)
 
 
@@ -325,8 +329,9 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
         ridx_free.init(1)
         txl.ptx.fence.mbarrier_init.release.cluster()
 
-        with txl.If(txl.And(cta == 0, tid == 0)), txl.Then():
-            txl.ptx.st.global_.u32(sync_ctr.ptr_to([txl.cast((epoch + txl.uint32(1)) % txl.uint32(WORK_SLOTS), "int32")]), txl.uint32(0))
+        if not TAGGED:
+            with txl.If(txl.And(cta == 0, tid == 0)), txl.Then():
+                txl.ptx.st.global_.u32(sync_ctr.ptr_to([txl.cast((epoch + txl.uint32(1)) % txl.uint32(WORK_SLOTS), "int32")]), txl.uint32(0))
         with txl.If(warp == 1), txl.Then():
             txl.ptx["tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32"](
                 txl.address_of(tmem_slot[0]), txl.uint32(TMEM_COLS)
@@ -335,17 +340,12 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
         with txl.If(txl.And(warp == 0, lane == 0)), txl.Then():
             txl.ptx.prefetch.tensormap(txl.address_of(tm_w1h))
             txl.ptx.prefetch.tensormap(txl.address_of(tm_w2))
-        with txl.If(tid < (M + G - 1) // G), txl.Then():
-            row = cta + G * tid
-            with txl.If(row < M), txl.Then():
-                txl.ptx["cp.async.bulk.prefetch.L2.global"](hidden.ptr_to([row * (HID // 2)]), txl.uint32(HID * 2))
+        if not TAGGED or M == 8:
+            with txl.If(tid < (M + G - 1) // G), txl.Then():
+                row = cta + G * tid
+                with txl.If(row < M), txl.Then():
+                    txl.ptx["cp.async.bulk.prefetch.L2.global"](hidden.ptr_to([row * (HID // 2)]), txl.uint32(HID * 2))
 
-
-        if M == 16:
-            # Warm the whole route-weight table before the final packed sum.
-            with txl.If(tid < P // 4), txl.Then():
-                cached_weights = [txl.local_scalar(txl.f32) for _ in range(4)]
-                txl.ptx.ld.global_.nc.v4.f32(*cached_weights, topk_w.ptr_to([tid * 4]))
 
         for i in range((MASK_COUNT + NTHREADS - 1) // NTHREADS):
             idx = tid + NTHREADS * i
@@ -432,6 +432,9 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
             txl.cuda.iket.mark("tables-ready")
         C = txl.local_scalar(txl.i32)
         txl.ptx.ld.shared.s32(C, s_misc.ptr_to([0]))
+        generation = txl.local_scalar(txl.u32)
+        if not TAGGED:
+            txl.assign(generation, epoch)
         # Shape-only round-robin ownership removes the global work counter and
         # the per-item peer-index handoff at every routed shape.
         dyn = txl.int32(0) != txl.int32(0)
@@ -471,13 +474,11 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                                 txl.ptx.ld.relaxed.gpu.global_.u64(records[route], out.ptr_to([(token * TOPK + route) * (HID // 2) + column_pair]))
                             for route in range(TOPK):
                                 stamp = txl.cast(txl.shift_right(records[route], txl.uint64(32)), "uint32")
-                                txl.assign(pending, pending | (stamp ^ epoch))
+                                txl.assign(pending, pending | (stamp ^ generation))
                         values = txl.alloc_local((TOPK,), txl.u32)
-                        weights = txl.alloc_local((TOPK,), txl.f32)
                         for route in range(TOPK):
                             txl.assign(values[route], txl.cast(records[route], "uint32"))
-                            txl.ptx.ld.global_.nc.f32(weights[route], topk_w.ptr_to([token * TOPK + route]))
-                            txl.ptx.mul.rn.f32(weights[route], weights[route], rsf)
+                        weights = _load_route_weights(topk_w, token * TOPK, rsf, TOPK)
                         packed = _route_sum_bf16x2(values, weights, TOPK, packed_f32)
                         col = (column_pair // BM) * 2 * BM + column_pair % BM
                         txl.ptx.st.global_.u16(final_out.ptr_to([token * HID + col]), txl.cast(packed,"uint16"))
@@ -498,7 +499,7 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                     completed = txl.local_scalar(txl.u32)
                     # Consecutive release RMWs publish all producers; acquire
                     # the completed sequence before the CTA shares its results.
-                    target_count = _u32(epoch * txl.uint32(G))
+                    target_count = _u32(generation * txl.uint32(G))
                     txl.ptx.ld.relaxed.gpu.global_.u32(completed, sync_ctr.ptr_to([PRODUCERS_DONE]))
                     with txl.While(completed != target_count):
                         txl.ptx.ld.relaxed.gpu.global_.u32(completed, sync_ctr.ptr_to([PRODUCERS_DONE]))
@@ -667,7 +668,7 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                 idx = _i32(cl)
                 nxt_idx = _i32(txl.int32(0))
                 nxt = txl.local_scalar(txl.u32, init=txl.uint32(0))
-                work_slot = txl.cast(epoch % txl.uint32(WORK_SLOTS), "int32")
+                work_slot = txl.cast(generation % txl.uint32(WORK_SLOTS), "int32")
                 lane_lt = txl.shift_left(txl.uint32(1), txl.cast(lane, "uint32")) - txl.uint32(1)
                 running = _i32(txl.int32(1))
                 txl.ptx.barrier.cluster.wait()
@@ -818,6 +819,8 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                             txl.assign(idx, nxt_idx)
 
             with idle_role:
+                if TAGGED:
+                    txl.ptx.ld.relaxed.gpu.global_.u32(generation, sync_ctr.ptr_to([cta]))
                 if FIRST_TILE:
                     # Quantize and publish this CTA's own token row(s) for other CTAs' gathers (two
                     # lanes per k-block), so the quantizer warps start the first item's B tile at once.
@@ -828,7 +831,7 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                             quant_unit_T(RQ_T, txl.int32(0), lane // RQ_T, txl.int32(0), row, lane % RQ_T, to_global=True)
                         txl.cuda.warp_sync()
                         with txl.If(txl.And(row < M, lane == 0)), txl.Then():
-                            txl.ptx.st.release.gpu.global_.u32(xflag_g.ptr_to([row]), epoch)
+                            txl.ptx.st.release.gpu.global_.u32(xflag_g.ptr_to([row]), generation)
                     _rng_end(tk_i)
                 if GLOBAL_Q and not FIRST_TILE:
                     for r_ in range(ROWS_PER_CTA):
@@ -836,7 +839,7 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                         # The idle and quantizer warps rendezvous at distinct sites.
                         txl.ptx.barrier.cta.sync(txl.uint32(BAR_ROWS), txl.uint32(NQUANT + 32))
                         with txl.If(txl.And(row < M, lane == 0)), txl.Then():
-                            txl.ptx.st.release.gpu.global_.u32(xflag_g.ptr_to([row]), epoch)
+                            txl.ptx.st.release.gpu.global_.u32(xflag_g.ptr_to([row]), generation)
                 # Cluster slot-release agent (see v47 notes): release the peer's slot k%2 once this
                 # CTA published item k's activation (aq_full) and, in the rank path, its down MMAs
                 # finished reading the activation slot (act_empty).  Only items with a successor k+2
@@ -1100,6 +1103,8 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
 
 
         with quant_role:
+            if TAGGED:
+                txl.ptx.ld.relaxed.gpu.global_.u32(generation, sync_ctr.ptr_to([cta]))
             tq = tid - QUANT_WARP0 * 32
             ts = txl.PipelineState(TASK_RING, phase=0)
             gst = txl.PipelineState(2, phase=0)
@@ -1117,7 +1122,7 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                         tokf = tok_of(tq)
                         fl = txl.local_scalar(txl.u32, init=txl.uint32(0))
                         txl.ptx.ld.acquire.gpu.global_.b32(fl, xflag_g.ptr_to([tokf]))
-                        with txl.While(fl != epoch):
+                        with txl.While(fl != generation):
                             txl.ptx.ld.acquire.gpu.global_.b32(fl, xflag_g.ptr_to([tokf]))
                 txl.ptx.bar.sync(txl.uint32(BAR_QUANT), txl.uint32(NQUANT))
                 wv = txl.alloc_local((4 * NT,), txl.u32)
@@ -1256,11 +1261,9 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                     release_task(ts, False)
             txl.ptx.barrier.cluster.wait()
 
-            if M == 8:
-                finalize_routes(tq, NQUANT, False)
-
-
         with math_role:
+            if TAGGED:
+                txl.ptx.ld.relaxed.gpu.global_.u32(generation, sync_ctr.ptr_to([cta]))
             mw = warp - MATH_WARP0
             tm = mw * 32 + lane
             is_gate = mw < 2
@@ -1572,7 +1575,7 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                                     hi = _f32(pv[(2 * pair + 1) * NT + t_] * (w2s4[2 * pair + 1] * acts[t_]))
                                     txl.ptx.cvt.rn.bf16x2.f32(payload, hi, lo)
                                     record = txl.local_scalar("uint64")
-                                    txl.ptx.mov.b64(record, payload, epoch)
+                                    txl.ptx.mov.b64(record, payload, generation)
                                     txl.ptx.st.relaxed.gpu.global_.u64(out.ptr_to([routes[t_] * (HID // 2) + h_pair * BM + tm]), record, pred=valid)
                         else:
                             for q in range(4):
@@ -1682,10 +1685,17 @@ def build_kernel(G, M, TOPK, E, HID, INTER, cs=CS):
                     txl.ptx.red.release.gpu.global_.add.u32(sync_ctr.ptr_to([PRODUCERS_DONE]), txl.uint32(1))
 
         txl.cuda.cta_sync()
-        if M >= 16:
+        if M == 8:
+            with txl.If(warp == 1), txl.Then():
+                txl.ptx["tcgen05.dealloc.cta_group::1.sync.aligned.b32"](tmem_base, txl.uint32(TMEM_COLS))
+        if M >= 8:
+            if TAGGED:
+                with txl.If(warp < 3), txl.Then():
+                    txl.ptx.ld.relaxed.gpu.global_.u32(generation, sync_ctr.ptr_to([cta]))
             finalize_routes(tid, NTHREADS, True)
-        with txl.If(warp == 1), txl.Then():
-            txl.ptx["tcgen05.dealloc.cta_group::1.sync.aligned.b32"](tmem_base, txl.uint32(TMEM_COLS))
+        if M != 8:
+            with txl.If(warp == 1), txl.Then():
+                txl.ptx["tcgen05.dealloc.cta_group::1.sync.aligned.b32"](tmem_base, txl.uint32(TMEM_COLS))
 
 
         with txl.If(dyn), txl.Then():
@@ -2231,7 +2241,8 @@ def make_runner(executable, data, M, cs):
     for t in (hidden, topk_ids, topk_w, w1, w1s, w2, w2s, out):
         assert t.is_contiguous()
 
-    sync_ctr = torch.zeros(128, dtype=torch.uint32, device=device)
+    counter_size = max(128, _grid_for(M, topk, torch.cuda.get_device_properties(device).multi_processor_count))
+    sync_ctr = torch.zeros(counter_size, dtype=torch.uint32, device=device)
     if M <= 32:
         partials = torch.zeros(int(M) * topk * (HID // 2), dtype=torch.uint64, device=device)
     else:

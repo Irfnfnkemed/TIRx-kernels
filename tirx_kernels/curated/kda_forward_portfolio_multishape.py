@@ -666,6 +666,9 @@ def build_kernel(
                         ring_full.ptr_to([sc]), txl.uint32(3 * BT * D * 2 + 1024)
                     )
 
+            # The scheduler's generic shared-memory reads use storage that is
+            # subsequently recycled for the first async TMA input tile.
+            txl.ptx.fence.proxy.async_.shared__cta()
             issue_loads(txl.int32(0))
             with txl.If(n_items > 1), txl.Then():
                 issue_loads(txl.int32(1))
@@ -3752,9 +3755,15 @@ def get_kernel(**kwargs: Any):
 
     cfg = _cfg(**kwargs)
     if not cfg.packed:
+        # The scored B200 layouts use one head per chain CTA for H=64 and
+        # paired heads for H=96. Keep the analysis entry point aligned with
+        # the default runtime dispatch; allow its explicit override as well.
+        hpc = kwargs.get("hpc", os.environ.get("KDA_HPC", "auto"))
+        if hpc == "auto":
+            hpc = 1 if cfg.num_heads == 64 else 2
         return {
             "kda_front": make_front(cfg.num_heads).func,
-            "kda_chain": make_chain(cfg.num_heads).func,
+            "kda_chain": make_chain(cfg.num_heads, int(hpc)).func,
         }
     return build_kernel(cfg.num_heads).func
 
